@@ -1,5 +1,6 @@
 # Binaries
-sendme
+/sendme
+sendme.exe
 *.exe
 *.exe~
 *.dll
