@@ -46,15 +46,24 @@ func NewNode(ctx context.Context, port int) (*Node, error) {
 
 	// 创建 Peer Source 函数，从已连接的 peers 中发现中继服务器
 	// 使用闭包捕获 host 引用
+	// 注意：这个函数在节点刚创建时可能返回空结果，因为还没有连接的 peers
+	// AutoRelay 会定期调用这个函数来发现中继服务器
 	peerSource := func(ctx context.Context, numPeers int) <-chan peer.AddrInfo {
-		r := make(chan peer.AddrInfo)
+		r := make(chan peer.AddrInfo, numPeers)
 		go func() {
 			defer close(r)
 			if h == nil {
 				return
 			}
 			// 从已连接的 peers 中查找支持中继的节点
-			for _, peerID := range h.Network().Peers() {
+			peers := h.Network().Peers()
+			if len(peers) == 0 {
+				// 如果没有已连接的 peers，返回空结果
+				// AutoRelay 会通过其他机制（如 DHT）发现中继
+				return
+			}
+
+			for _, peerID := range peers {
 				select {
 				case <-ctx.Done():
 					return
@@ -166,18 +175,83 @@ func (n *Node) ConnectToPeer(ctx context.Context, peerAddr string) error {
 		return fmt.Errorf("failed to parse peer info: %w", err)
 	}
 
-	// 设置连接超时
-	connectCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	// 等待一段时间，让节点有机会发现和连接到中继服务器
+	// 这对于跨网络连接很重要
+	// 同时检查是否有可用的中继连接
+	fmt.Printf("Connecting to peer... (this may take a few seconds for relay discovery)\n")
+	time.Sleep(5 * time.Second)
+
+	// 设置连接超时，给足够的时间让中继连接建立
+	connectCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 
 	// libp2p 的 Connect 会自动处理：
 	// - 直连尝试
 	// - 如果失败，自动通过 AutoRelay 使用中继服务器
+	// 但我们需要确保接收端也有中继连接可用
+
+	// 检查是否有可用的中继连接
+	connectedPeers := n.Host.Network().Peers()
+	fmt.Printf("Current connected peers: %d\n", len(connectedPeers))
+
 	if err := n.Host.Connect(connectCtx, *info); err != nil {
-		return fmt.Errorf("failed to connect to peer (tried direct and relay): %w", err)
+		fmt.Printf("Direct connection failed: %v\n", err)
+		fmt.Printf("Attempting relay connection...\n")
+
+		// 如果连接失败，尝试通过中继连接
+		// 检查是否有可用的中继连接
+		relayAddrs := n.findRelayAddresses(info.ID)
+		if len(relayAddrs) > 0 {
+			fmt.Printf("Found %d relay addresses, attempting connection...\n", len(relayAddrs))
+			// 尝试通过中继连接
+			relayInfo := peer.AddrInfo{
+				ID:    info.ID,
+				Addrs: relayAddrs,
+			}
+			if relayErr := n.Host.Connect(connectCtx, relayInfo); relayErr != nil {
+				return fmt.Errorf("failed to connect to peer (tried direct and relay): direct=%v, relay=%v. Make sure the sender is still running.", err, relayErr)
+			}
+			fmt.Printf("Connected via relay!\n")
+			return nil
+		}
+
+		// 如果没有找到中继，提供更详细的错误信息
+		return fmt.Errorf("failed to connect to peer: %w. Possible reasons: 1) Sender is not running, 2) Network connectivity issues, 3) No relay servers available. Make sure the sender is still running and try again.", err)
 	}
 
+	fmt.Printf("Connected successfully!\n")
+
 	return nil
+}
+
+// findRelayAddresses 查找可用的中继地址
+func (n *Node) findRelayAddresses(targetPeer peer.ID) []multiaddr.Multiaddr {
+	var relayAddrs []multiaddr.Multiaddr
+
+	// 从已连接的 peers 中查找中继服务器
+	for _, peerID := range n.Host.Network().Peers() {
+		// 检查这个 peer 是否支持中继协议
+		protos, err := n.Host.Peerstore().GetProtocols(peerID)
+		if err == nil {
+			for _, proto := range protos {
+				// 检查是否支持 circuit relay
+				if proto == "/libp2p/circuit/relay/0.2.0" {
+					// 构建通过中继的地址
+					addrs := n.Host.Peerstore().Addrs(peerID)
+					for _, addr := range addrs {
+						// 构建 /p2p-circuit 地址
+						relayAddr, err := multiaddr.NewMultiaddr(fmt.Sprintf("%s/p2p/%s/p2p-circuit/p2p/%s",
+							addr.String(), peerID.String(), targetPeer.String()))
+						if err == nil {
+							relayAddrs = append(relayAddrs, relayAddr)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return relayAddrs
 }
 
 // GetPeerAddr 获取节点的完整地址（用于生成 ticket）
